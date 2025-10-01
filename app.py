@@ -1,4 +1,4 @@
-# app.py - LINE x ClickUp Integration (ฉบับสมบูรณ์)
+# app.py - LINE x ClickUp Integration (แก้ไขแล้ว)
 from flask import Flask, request, jsonify, render_template_string
 from linebot import LineBotApi, WebhookHandler
 from linebot.models import TextSendMessage
@@ -9,6 +9,7 @@ import json
 import requests
 import os
 from datetime import datetime
+import threading
 
 # ============ CONFIG ============
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "3ZVjgFTiTSSfcPrrOWepkSER5JuUeemSH8V2niYLY+jGumWEWX7ftN56ZcxWMmCpQcynRyTvZqiGAlCSLP8sbCLqZbrzIFUTtetDwVdaaarmN+nDnMjU5TOrmFecDRZROIUYPNMhavx0yC5FJGR6xgdB04t89/1O/w1cDnyilFU=")
@@ -21,6 +22,9 @@ CLICKUP_DROPDOWN_FIELD_ID = os.environ.get("CLICKUP_DROPDOWN_FIELD_ID", "b7a3812
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 app = Flask(__name__)
+
+# สร้าง lock สำหรับป้องกันการสร้างรหัสซ้ำ
+db_lock = threading.Lock()
 
 # ============ สถานะและข้อความ ============
 STATUS_MESSAGES = {
@@ -38,6 +42,7 @@ STATUS_MESSAGES = {
 # ============ DATABASE ============
 def get_db_connection():
     conn = sqlite3.connect("customers.db", check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 def init_db():
@@ -67,44 +72,69 @@ def clean_name(name):
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned.lower()
 
-# ============ จัดการลูกค้า ============
+# ============ จัดการลูกค้า (แก้ไขแล้ว - ป้องกันรหัสซ้ำ) ============
 def generate_customer_code():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM customers")
-    count = c.fetchone()[0]
-    conn.close()
-    return f"CUS{str(count + 1).zfill(4)}"
+    """สร้างรหัสลูกค้าแบบไม่ซ้ำ"""
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # ดึงรหัสล่าสุด
+        c.execute("SELECT customer_code FROM customers ORDER BY customer_code DESC LIMIT 1")
+        last_code = c.fetchone()
+        
+        if last_code:
+            # ดึงเลขจากรหัส เช่น CUS0001 -> 1
+            last_num = int(last_code[0].replace("CUS", ""))
+            new_num = last_num + 1
+        else:
+            new_num = 1
+        
+        customer_code = f"CUS{str(new_num).zfill(4)}"
+        conn.close()
+        return customer_code
 
 def save_customer(line_user_id, display_name, phone=None):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT customer_code, display_name FROM customers WHERE line_user_id=?", (line_user_id,))
-    existing = c.fetchone()
-    
-    if existing:
-        if existing[1] != display_name:
-            clean_name_value = clean_name(display_name)
-            c.execute("UPDATE customers SET display_name=?, clean_name=? WHERE line_user_id=?",
-                     (display_name, clean_name_value, line_user_id))
+    """บันทึกลูกค้า - ป้องกันรหัสซ้ำ"""
+    with db_lock:
+        conn = get_db_connection()
+        c = conn.cursor()
+        
+        # เช็คว่ามีอยู่แล้วหรือไม่
+        c.execute("SELECT customer_code, display_name FROM customers WHERE line_user_id=?", (line_user_id,))
+        existing = c.fetchone()
+        
+        if existing:
+            # อัปเดตชื่อถ้าเปลี่ยน
+            if existing[1] != display_name:
+                clean_name_value = clean_name(display_name)
+                c.execute("UPDATE customers SET display_name=?, clean_name=? WHERE line_user_id=?",
+                         (display_name, clean_name_value, line_user_id))
+                conn.commit()
+                print(f"🔄 อัปเดตชื่อ {existing[0]}")
+            conn.close()
+            return existing[0], False  # False = ไม่ใช่ลูกค้าใหม่
+        
+        # สร้างลูกค้าใหม่
+        customer_code = generate_customer_code()
+        clean_name_value = clean_name(display_name)
+        created_at = datetime.now().isoformat()
+        
+        try:
+            c.execute("""
+                INSERT INTO customers (customer_code, line_user_id, display_name, clean_name, phone, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (customer_code, line_user_id, display_name, clean_name_value, phone, created_at))
+            
             conn.commit()
-            print(f"🔄 อัปเดตชื่อ {existing[0]}")
-        conn.close()
-        return existing[0]
-    
-    customer_code = generate_customer_code()
-    clean_name_value = clean_name(display_name)
-    created_at = datetime.now().isoformat()
-    
-    c.execute("""
-        INSERT INTO customers (customer_code, line_user_id, display_name, clean_name, phone, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (customer_code, line_user_id, display_name, clean_name_value, phone, created_at))
-    
-    conn.commit()
-    conn.close()
-    print(f"✅ บันทึก: {customer_code} - {display_name}")
-    return customer_code
+            print(f"✅ บันทึกลูกค้าใหม่: {customer_code} - {display_name}")
+            conn.close()
+            return customer_code, True  # True = ลูกค้าใหม่
+        except sqlite3.IntegrityError as e:
+            print(f"❌ Error บันทึกลูกค้า: {e}")
+            conn.close()
+            # ถ้าซ้ำ ลองสร้างรหัสใหม่อีกครั้ง
+            return save_customer(line_user_id, display_name, phone)
 
 def get_customer_by_code(customer_code):
     conn = get_db_connection()
@@ -123,16 +153,17 @@ def search_customer(keyword):
     c.execute("""
         SELECT customer_code, display_name, clean_name, line_user_id, created_at
         FROM customers 
-        WHERE clean_name LIKE ? OR customer_code LIKE ?
+        WHERE clean_name LIKE ? OR customer_code LIKE ? OR display_name LIKE ?
         ORDER BY created_at DESC
         LIMIT 50
-    """, (f"%{clean_keyword}%", f"%{keyword.upper()}%"))
+    """, (f"%{clean_keyword}%", f"%{keyword.upper()}%", f"%{keyword}%"))
     rows = c.fetchall()
     conn.close()
     return rows
 
 # ============ อัปเดต CLICKUP DROPDOWN ============
 def update_clickup_dropdown(customer_code, display_name, clean_name_value):
+    """อัปเดตรายชื่อลูกค้าใน ClickUp Dropdown"""
     if not CLICKUP_LIST_ID or not CLICKUP_DROPDOWN_FIELD_ID:
         print("ℹ️ ไม่ได้ตั้งค่า ClickUp Dropdown")
         return False
@@ -142,9 +173,11 @@ def update_clickup_dropdown(customer_code, display_name, clean_name_value):
         "Content-Type": "application/json"
     }
     
+    # รูปแบบ: CUS0001 - ชื่อลูกค้า (ชื่อค้นหา)
     option_name = f"{customer_code} - {display_name} ({clean_name_value})"
     
     try:
+        # ดึง Custom Fields ปัจจุบัน
         response = requests.get(
             f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/field",
             headers=headers,
@@ -167,6 +200,7 @@ def update_clickup_dropdown(customer_code, display_name, clean_name_value):
             print(f"❌ ไม่พบ Field ID: {CLICKUP_DROPDOWN_FIELD_ID}")
             return False
         
+        # เช็คว่ามีตัวเลือกนี้แล้วหรือไม่
         existing_options = target_field.get("type_config", {}).get("options", [])
         option_exists = any(opt.get("name") == option_name for opt in existing_options)
         
@@ -174,9 +208,11 @@ def update_clickup_dropdown(customer_code, display_name, clean_name_value):
             print(f"ℹ️ มี '{option_name}' แล้ว")
             return True
         
+        # เพิ่มตัวเลือกใหม่ (ใส่ด้านบนสุด)
         new_option = {"name": option_name, "color": None}
         new_options = [new_option] + existing_options
         
+        # อัปเดต Dropdown
         update_response = requests.put(
             f"https://api.clickup.com/api/v2/list/{CLICKUP_LIST_ID}/field/{CLICKUP_DROPDOWN_FIELD_ID}",
             headers=headers,
@@ -185,17 +221,17 @@ def update_clickup_dropdown(customer_code, display_name, clean_name_value):
         )
         
         if update_response.status_code == 200:
-            print(f"✅ เพิ่ม '{option_name}' แล้ว")
+            print(f"✅ เพิ่ม '{option_name}' ลงใน ClickUp Dropdown")
             return True
         else:
             print(f"❌ อัปเดตไม่ได้: {update_response.text}")
             return False
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error อัปเดต Dropdown: {e}")
         return False
 
-# ============ HTML SEARCH PAGE ============
+# ============ HTML SEARCH PAGE (แก้ไขแล้ว) ============
 SEARCH_PAGE = """
 <!DOCTYPE html>
 <html lang="th">
@@ -272,12 +308,17 @@ SEARCH_PAGE = """
             padding: 40px;
             color: #999;
         }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #667eea;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔍 ค้นหาลูกค้า</h1>
-        <p class="subtitle">พิมพ์ชื่อหรือรหัส (ไม่ต้องพิมพ์อิโมจิ)</p>
+        <p class="subtitle">พิมพ์ชื่อหรือรหัสลูกค้า</p>
         <input type="text" id="searchInput" placeholder="เช่น: สมชาย, CUS0001" autofocus>
         <div id="results"></div>
     </div>
@@ -290,38 +331,48 @@ SEARCH_PAGE = """
             clearTimeout(debounceTimer);
             const keyword = this.value.trim();
             
-            if (keyword.length < 2) {
+            if (keyword.length < 1) {
                 resultsDiv.innerHTML = '';
                 return;
             }
 
-            resultsDiv.innerHTML = '<p style="text-align:center;color:#667eea;padding:20px;">🔄 กำลังค้นหา...</p>';
+            resultsDiv.innerHTML = '<div class="loading">🔄 กำลังค้นหา...</div>';
 
             debounceTimer = setTimeout(() => {
                 fetch('/api/search?q=' + encodeURIComponent(keyword))
-                    .then(res => res.json())
+                    .then(res => {
+                        if (!res.ok) throw new Error('Network error');
+                        return res.json();
+                    })
                     .then(data => {
-                        if (data.results.length === 0) {
-                            resultsDiv.innerHTML = '<div class="no-results">😔 ไม่พบข้อมูล</div>';
+                        if (!data.results || data.results.length === 0) {
+                            resultsDiv.innerHTML = '<div class="no-results">😔 ไม่พบลูกค้า</div>';
                             return;
                         }
                         let html = '';
                         data.results.forEach(customer => {
                             html += '<div class="customer-card">';
-                            html += '<div class="customer-code">' + customer.code;
-                            html += '<button class="copy-btn" onclick="copyCode(\'' + customer.code + '\', this)">📋 คัดลอก</button>';
+                            html += '<div class="customer-code">' + escapeHtml(customer.code);
+                            html += '<button class="copy-btn" onclick="copyCode(\'' + escapeHtml(customer.code) + '\', this)">📋 คัดลอก</button>';
                             html += '</div>';
-                            html += '<div>📝 ' + customer.display_name + '</div>';
-                            html += '<div style="color:#999;font-size:14px;">🔎 ' + customer.clean_name + '</div>';
+                            html += '<div>📝 ' + escapeHtml(customer.display_name) + '</div>';
+                            html += '<div style="color:#999;font-size:14px;">🔎 ' + escapeHtml(customer.clean_name) + '</div>';
                             html += '</div>';
                         });
                         resultsDiv.innerHTML = html;
                     })
-                    .catch(() => {
-                        resultsDiv.innerHTML = '<div class="no-results">❌ เกิดข้อผิดพลาด</div>';
+                    .catch(err => {
+                        console.error('Error:', err);
+                        resultsDiv.innerHTML = '<div class="no-results">❌ เกิดข้อผิดพลาด กรุณาลองใหม่</div>';
                     });
             }, 300);
         });
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
 
         function copyCode(code, btn) {
             navigator.clipboard.writeText(code).then(() => {
@@ -382,19 +433,23 @@ def search_page():
 
 @app.route("/api/search")
 def search_api():
-    keyword = request.args.get("q", "")
-    results = search_customer(keyword)
-    return jsonify({
-        "results": [
-            {
-                "code": row[0], 
-                "display_name": row[1], 
-                "clean_name": row[2], 
-                "user_id": row[3]
-            }
-            for row in results
-        ]
-    })
+    try:
+        keyword = request.args.get("q", "")
+        results = search_customer(keyword)
+        return jsonify({
+            "results": [
+                {
+                    "code": row[0], 
+                    "display_name": row[1], 
+                    "clean_name": row[2], 
+                    "user_id": row[3]
+                }
+                for row in results
+            ]
+        })
+    except Exception as e:
+        print(f"❌ Search API Error: {e}")
+        return jsonify({"results": []}), 500
 
 @app.route("/customers")
 def list_customers():
@@ -429,7 +484,7 @@ def list_customers():
     html += "</table></body></html>"
     return html
 
-# ============ LINE WEBHOOK ============
+# ============ LINE WEBHOOK (แก้ไขแล้ว - ไม่ส่งข้อความหาลูกค้า) ============
 @app.route("/line_webhook", methods=["POST"])
 def line_webhook():
     body = request.get_data(as_text=True)
@@ -442,25 +497,15 @@ def line_webhook():
                     profile = line_bot_api.get_profile(user_id)
                     display_name = profile.display_name
                     clean_name_value = clean_name(display_name)
-                    customer_code = save_customer(user_id, display_name)
+                    
+                    # บันทึกลูกค้า (ไม่ส่งข้อความกลับ)
+                    customer_code, is_new = save_customer(user_id, display_name)
                     
                     # อัปเดต ClickUp Dropdown (ถ้าตั้งค่าแล้ว)
                     if CLICKUP_LIST_ID and CLICKUP_DROPDOWN_FIELD_ID:
                         update_clickup_dropdown(customer_code, display_name, clean_name_value)
                     
-                    # ข้อความตอบกลับ
-                    reply_msg = f"""✅ บันทึกข้อมูลเรียบร้อย
-
-🆔 รหัสลูกค้า: {customer_code}
-📝 ชื่อ: {display_name}
-
-เราจะแจ้งสถานะงานให้คุณทราบอัตโนมัติค่ะ 💚"""
-                    
-                    line_bot_api.reply_message(
-                        event["replyToken"], 
-                        TextSendMessage(text=reply_msg)
-                    )
-                    print(f"✅ {customer_code} - {display_name}")
+                    print(f"✅ บันทึก {customer_code} - {display_name} ({'ใหม่' if is_new else 'เดิม'})")
                     
                 except LineBotApiError as e:
                     print(f"❌ LINE API Error: {e}")
@@ -478,7 +523,6 @@ def clickup_webhook():
     try:
         data = request.json
         
-        # เช็คว่าเป็น task status update
         if data.get("event") != "taskStatusUpdated":
             return "OK"
         
@@ -495,7 +539,7 @@ def clickup_webhook():
             print("⚠️ ไม่พบการเปลี่ยนสถานะ")
             return "OK"
         
-        # ดึงข้อมูล Task จาก ClickUp
+        # ดึงข้อมูล Task
         headers = {"Authorization": CLICKUP_API_TOKEN}
         task_response = requests.get(
             f"https://api.clickup.com/api/v2/task/{task_id}",
@@ -510,14 +554,13 @@ def clickup_webhook():
         task_data = task_response.json()
         task_name = task_data.get("name", "")
         
-        # หารหัสลูกค้าจาก Custom Field "รหัสลูกค้า"
+        # หารหัสลูกค้าจาก Custom Field
         customer_code = None
         for field in task_data.get("custom_fields", []):
             field_name = field.get("name", "")
             if field_name in ["รหัสลูกค้า", "CUSTOMER_CODE", "Customer Code"]:
                 value = field.get("value")
                 
-                # Dropdown จะส่งมาเป็น dict หรือ string
                 if isinstance(value, dict):
                     customer_code = value.get("name", "").split(" - ")[0].strip()
                 elif isinstance(value, str):
@@ -529,21 +572,20 @@ def clickup_webhook():
             print(f"⚠️ Task {task_id} ไม่มีรหัสลูกค้า")
             return "OK"
         
-        # ดึงข้อมูลลูกค้าจากฐานข้อมูล
+        # ดึงข้อมูลลูกค้า
         customer = get_customer_by_code(customer_code)
         
         if not customer:
             print(f"❌ ไม่พบลูกค้ารหัส: {customer_code}")
             return "OK"
         
-        # customer = (customer_code, line_user_id, display_name, clean_name, phone, created_at)
         line_user_id = customer[1]
         customer_name = customer[2]
         
         # ดึงข้อความตามสถานะ
         status_text = STATUS_MESSAGES.get(new_status, f"งานของคุณอัปเดตสถานะแล้วค่ะ")
         
-        # สร้างข้อความ: คุณ [ชื่อ] [emoji] [ข้อความ]
+        # สร้างข้อความ
         message = f"คุณ {customer_name} {status_text}"
         
         # ส่งข้อความ LINE
@@ -552,7 +594,7 @@ def clickup_webhook():
                 line_user_id, 
                 TextSendMessage(text=message)
             )
-            print(f"✅ ส่งข้อความถึง {customer_code} สำเร็จ (สถานะ: {new_status})")
+            print(f"✅ ส่งข้อความถึง {customer_code} ({new_status})")
         except LineBotApiError as e:
             print(f"❌ ส่งข้อความไม่สำเร็จ: {e}")
         except Exception as e:
@@ -571,8 +613,6 @@ def health():
         "status": "ok",
         "timestamp": datetime.now().isoformat()
     })
-
-# ============ MAIN ============
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
