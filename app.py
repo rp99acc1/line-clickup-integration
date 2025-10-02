@@ -1,8 +1,15 @@
-# app.py - LINE x ClickUp Integration (Final Version)
+# app.py - LINE x ClickUp Integration (Fixed for LINE SDK v3)
 from flask import Flask, request, jsonify, render_template_string
-from linebot import LineBotApi, WebhookHandler
-from linebot.models import TextSendMessage
-from linebot.exceptions import LineBotApiError
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    PushMessageRequest,
+    TextMessage
+)
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 import sqlite3
 import re
 import json
@@ -20,7 +27,7 @@ CLICKUP_API_TOKEN = os.environ.get("CLICKUP_API_TOKEN", "pk_696759_N61E72DVCLJ2J
 CLICKUP_LIST_ID = os.environ.get("CLICKUP_LIST_ID", "14235588")
 CLICKUP_DROPDOWN_FIELD_ID = os.environ.get("CLICKUP_DROPDOWN_FIELD_ID", "")
 
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 app = Flask(__name__)
 
@@ -406,94 +413,55 @@ def list_customers():
     html += "</table></body></html>"
     return html
 
-# ============ LINE WEBHOOK ============
+# ============ LINE WEBHOOK (Fixed for LINE SDK v3) ============
 @app.route("/line_webhook", methods=["POST"])
 def line_webhook():
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    
     try:
-        events = json.loads(body).get("events", [])
-        for event in events:
-            if event["type"] == "message" and event["message"]["type"] == "text":
-                user_id = event["source"]["userId"]
-                try:
-                    profile = line_bot_api.get_profile(user_id)
-                    display_name = profile.display_name
-                    clean_name_value = clean_name(display_name)
-                    
-                    customer_code, is_new = save_customer(user_id, display_name)
-                    
-                    if is_new and CLICKUP_DROPDOWN_FIELD_ID:
-                        update_clickup_dropdown_async(customer_code, display_name, clean_name_value)
-                    
-                    print(f"{'✅ บันทึกใหม่' if is_new else 'ℹ️ มีแล้ว'}: {customer_code} - {display_name}")
-                    
-                except Exception as e:
-                    print(f"❌ Error: {e}")
-        
-        return "OK"
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        return "Invalid signature", 400
     except Exception as e:
-        print(f"❌ Webhook error: {e}")
-        return "Error", 500
+        print(f"❌ Error: {e}")
+    
+    return "OK"
 
-# ============ CLICKUP WEBHOOK ============
-@app.route("/clickup_webhook", methods=["POST"])
-def clickup_webhook():
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    user_id = event.source.user_id
+    
     try:
-        data = request.json
+        with ApiClient(configuration) as api_client:
+            api = MessagingApi(api_client)
+            profile = api.get_profile(user_id)
+            display_name = profile.display_name
+            
+        clean_name_value = clean_name(display_name)
+        customer_code, is_new = save_customer(user_id, display_name)
         
-        if data.get("event") != "taskStatusUpdated":
-            return "OK"
+        if is_new and CLICKUP_DROPDOWN_FIELD_ID:
+            update_clickup_dropdown_async(customer_code, display_name, clean_name_value)
         
-        task_id = data.get("task_id")
-        new_status = None
+        print(f"{'✅ ใหม่' if is_new else 'ℹ️ เดิม'}: {customer_code} - {display_name}")
         
-        for item in data.get("history_items", []):
-            if item.get("field") == "status":
-                new_status = item.get("after", {}).get("status")
-                break
-        
-        if not new_status:
-            return "OK"
-        
-        headers = {"Authorization": CLICKUP_API_TOKEN}
-        task_resp = requests.get(f"https://api.clickup.com/api/v2/task/{task_id}", headers=headers, timeout=10)
-        
-        if task_resp.status_code != 200:
-            return "OK"
-        
-        task_data = task_resp.json()
-        customer_code = None
-        
-        for field in task_data.get("custom_fields", []):
-            if field.get("name") in ["รหัสลูกค้า", "CUSTOMER_CODE", "Customer Code"]:
-                value = field.get("value")
-                if isinstance(value, dict):
-                    customer_code = value.get("name", "").split(" - ")[0].strip()
-                elif isinstance(value, str):
-                    customer_code = value.split(" - ")[0].strip()
-                break
-        
-        if not customer_code:
-            return "OK"
-        
-        customer = get_customer_by_code(customer_code)
-        if not customer:
-            print(f"❌ ไม่พบ: {customer_code}")
-            return "OK"
-        
-        status_text = STATUS_MESSAGES.get(new_status, "งานของคุณอัปเดตสถานะแล้วค่ะ")
-        message = f"คุณ {customer['display_name']} {status_text}"
-        
-        try:
-            line_bot_api.push_message(customer['line_user_id'], TextSendMessage(text=message))
-            print(f"✅ ส่งข้อความถึง {customer_code}")
-        except Exception as e:
-            print(f"❌ ส่งข้อความไม่ได้: {e}")
-        
-        return "OK"
     except Exception as e:
-        print(f"❌ ClickUp webhook error: {e}")
-        return "Error", 500
+        print(f"❌ Error: {e}")
+
+# ส่งข้อความ LINE (ใน clickup_webhook)
+try:
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.push_message(
+            PushMessageRequest(
+                to=customer['line_user_id'],
+                messages=[TextMessage(text=message)]
+            )
+        )
+    print(f"✅ ส่งข้อความถึง {customer_code}")
+except Exception as e:
+    print(f"❌ Error: {e}")
 
 # ============ HEALTH CHECK ============
 @app.route("/health")
