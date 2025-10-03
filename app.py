@@ -171,31 +171,49 @@ def list_customers():
 
 @app.route("/line_webhook", methods=["POST"])
 def line_webhook():
+    print("📥 LINE Webhook received")
     signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
+    print(f"Body: {body[:200]}")  # แสดง 200 ตัวอักษรแรก
+    
     try:
         handler.handle(body, signature)
+        print("✅ Webhook handled")
     except InvalidSignatureError:
+        print("❌ Invalid signature")
         return "Invalid signature", 400
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    
     return "OK"
 
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
+    print(f"📨 Message received from user: {event.source.user_id}")
     user_id = event.source.user_id
     try:
+        print(f"🔄 Getting profile...")
         with ApiClient(configuration) as api_client:
             api = MessagingApi(api_client)
             profile = api.get_profile(user_id)
             display_name = profile.display_name
+        
+        print(f"👤 Display name: {display_name}")
         clean_name_value = clean_name(display_name)
         customer_code, is_new = save_customer(user_id, display_name)
+        
+        print(f"💾 Saved: {customer_code} (new: {is_new})")
+        
         if is_new and CLICKUP_DROPDOWN_FIELD_ID:
             update_clickup_dropdown_async(customer_code, display_name, clean_name_value)
-        print(f"{'✅ ใหม่' if is_new else 'ℹ️ เดิม'}: {customer_code} - {display_name}")
+        
+        print(f"✅ Complete: {customer_code} - {display_name}")
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Error in handler: {e}")
+        import traceback
+        traceback.print_exc()
 
 @app.route("/clickup_webhook", methods=["POST"])
 def clickup_webhook():
